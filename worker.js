@@ -1,6 +1,7 @@
 /**
  * Cloudflare Worker: Gemini to OpenAI API Proxy
  * 部署后，baseURL 填写 Worker 的地址，API Key 填写你的 Gemini API Key
+ * 模型名称直接使用 Gemini 原模型名（如 gemini-2.0-flash, gemini-2.5-pro 等），不做映射
  */
 
 export default {
@@ -23,13 +24,8 @@ export default {
           );
         }
 
-        // 模型映射（如果你在客户端填了 gpt-3.5-turbo，会自动映射到 gemini 模型）
-        const modelMap = {
-          'gpt-3.5-turbo': 'gemini-2.0-flash',
-          'gpt-4': 'gemini-2.0-flash',
-          'gpt-4o': 'gemini-2.0-flash',
-        };
-        const model = modelMap[openaiReq.model] || openaiReq.model || 'gemini-2.0-flash';
+        // 直接使用客户端请求的模型名称，不映射（请确保填写的是 Google 支持的模型 ID）
+        const model = openaiReq.model || 'gemini-2.0-flash';
         const isStream = openaiReq.stream || false;
 
         // 将 OpenAI messages 转换为 Gemini contents
