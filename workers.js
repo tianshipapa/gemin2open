@@ -1,6 +1,8 @@
-// Cloudflare Pages Functions ¼æÈÝ°æ - OpenAI ¸ñÊ½ Gemini ´úÀí
+// Cloudflare Pages Workers éƒ¨ç½²ç‰ˆæœ¬
+// OpenAI API æ ¼å¼ä¸Ž Google Gemini API ä»£ç†é€‚é…å±‚
+
 export default {
-  async fetch (request, env, ctx) {
+  async fetch(request) {
     if (request.method === "OPTIONS") {
       return handleOPTIONS();
     }
@@ -65,7 +67,7 @@ const handleOPTIONS = async () => {
 
 const BASE_URL = "https://generativelanguage.googleapis.com";
 const API_VERSION = "v1beta";
-const API_CLIENT = "google-genai-sdk/2.19.0";
+const API_CLIENT = "google-genai-sdk/1.34.0";
 
 const makeHeaders = (apiKey, more) => ({
   "x-goog-api-client": API_CLIENT,
@@ -73,7 +75,7 @@ const makeHeaders = (apiKey, more) => ({
   ...more
 });
 
-async function handleModels (apiKey) {
+async function handleModels(apiKey) {
   const response = await fetch(`${BASE_URL}/${API_VERSION}/models`, {
     headers: makeHeaders(apiKey),
   });
@@ -94,7 +96,8 @@ async function handleModels (apiKey) {
 }
 
 const DEFAULT_EMBEDDINGS_MODEL = "gemini-embedding-001";
-async function handleEmbeddings (req, apiKey) {
+
+async function handleEmbeddings(req, apiKey) {
   let modelFull, model;
   switch (true) {
     case typeof req.model !== "string":
@@ -111,13 +114,13 @@ async function handleEmbeddings (req, apiKey) {
   }
   modelFull ??= "models/" + model;
   if (!Array.isArray(req.input)) {
-    req.input = [ req.input ];
+    req.input = [req.input];
   }
   const response = await fetch(`${BASE_URL}/${API_VERSION}/${modelFull}:batchEmbedContents`, {
     method: "POST",
     headers: makeHeaders(apiKey, { "Content-Type": "application/json" }),
     body: JSON.stringify({
-      "requests": req.input.map(text => ({
+      requests: req.input.map(text => ({
         model: modelFull,
         content: { parts: { text } },
         outputDimensionality: req.dimensions,
@@ -141,7 +144,8 @@ async function handleEmbeddings (req, apiKey) {
 }
 
 const DEFAULT_MODEL = "gemini-flash-latest";
-async function handleCompletions (req, apiKey) {
+
+async function handleCompletions(req, apiKey) {
   let model = req.model;
   switch (true) {
     case typeof model !== "string":
@@ -171,10 +175,10 @@ async function handleCompletions (req, apiKey) {
   }
   switch (true) {
     case model.endsWith(":search"):
-      model = model.slice(0,-7);
+      model = model.slice(0, -7);
     case req.model?.includes("-search-preview"):
       body.tools ??= [];
-      body.tools.push({googleSearch: {}});
+      body.tools.push({ googleSearch: {} });
   }
   const TASK = req.stream ? "streamGenerateContent" : "generateContent";
   let url = `${BASE_URL}/${API_VERSION}/models/${model}:${TASK}`;
@@ -239,7 +243,7 @@ const adjustProps = (schemaPart) => {
 const adjustSchema = (schema) => {
   const obj = schema[schema.type];
   delete obj.strict;
-  delete obj.parameters?.$schema;
+  delete obj.parameters;
   return adjustProps(schema);
 };
 
@@ -250,6 +254,7 @@ const harmCategory = [
   "HARM_CATEGORY_HARASSMENT",
   "HARM_CATEGORY_CIVIC_INTEGRITY",
 ];
+
 const safetySettings = harmCategory.map(category => ({
   category,
   threshold: "BLOCK_NONE",
@@ -276,6 +281,7 @@ const thinkingBudgetMap = {
   high: 24576,
   xhigh: 32768,
 };
+
 const thinkingLevelMap = {
   none: "minimal",
   xhigh: "high",
@@ -317,7 +323,6 @@ const transformConfig = (req, isV3) => {
   return cfg;
 };
 
-// Ìæ»» Node.js Buffer Îª Web Ô­Éú API£¬ÊÊÅä Cloudflare ÔËÐÐÊ±
 const parseImg = async (url) => {
   let mimeType, data;
   if (url.startsWith("http://") || url.startsWith("https://")) {
@@ -327,8 +332,8 @@ const parseImg = async (url) => {
         throw new Error(`${response.status} ${response.statusText} (${url})`);
       }
       mimeType = response.headers.get("content-type");
-      const arrayBuffer = await response.arrayBuffer();
-      data = btoa(String.fromCharCode(...new Uint8Array(arrayBuffer)));
+      const buffer = await response.arrayBuffer();
+      data = btoa(String.fromCharCode(...new Uint8Array(buffer)));
     } catch (err) {
       throw new Error("Error fetching image: " + err.toString());
     }
@@ -393,7 +398,7 @@ const transformFnCalls = ({ tool_calls }) => {
       console.error("Error parsing function arguments:", err);
       throw new HttpError("Invalid function arguments: " + argstr, 400);
     }
-    calls[id] = {i, name};
+    calls[id] = { i, name };
     return {
       functionCall: {
         id: id.startsWith("call_") ? null : id,
@@ -438,7 +443,7 @@ const transformMsg = async ({ content, extra_content }) => {
     if (parts.length === 1) {
       parts[0].thoughtSignature = thoughtSignature;
     } else {
-      parts.push({ text:"", thoughtSignature });
+      parts.push({ text: "", thoughtSignature });
     }
   }
   if (content.every(item => item.type === "image_url")) {
@@ -497,7 +502,7 @@ const transformTools = (req) => {
     tools = [{ function_declarations: funcs.map(schema => schema.function) }];
   }
   if (req.tool_choice) {
-    const allowed_function_names = req.tool_choice?.type === "function" ? [ req.tool_choice?.function?.name ] : undefined;
+    const allowed_function_names = req.tool_choice?.type === "function" ? [req.tool_choice?.function?.name] : undefined;
     if (allowed_function_names || typeof req.tool_choice === "string") {
       tool_config = {
         function_calling_config: {
@@ -513,7 +518,7 @@ const transformTools = (req) => {
 const transformRequest = async (req, isV3) => ({
   ...await transformMessages(req.messages),
   safetySettings,
-  generationConfig: transformConfig(req,isV3),
+  generationConfig: transformConfig(req, isV3),
   ...transformTools(req),
 });
 
@@ -531,7 +536,8 @@ const reasonsMap = {
 };
 
 const SEP = "\n\n|>";
-function transformCandidates (key, cand) {
+
+function transformCandidates(key, cand) {
   const message = { role: "assistant", content: [] };
   let thought_signature;
   for (const part of cand.content?.parts ?? []) {
@@ -540,13 +546,13 @@ function transformCandidates (key, cand) {
       message.tool_calls ??= [];
       const thought_signature = fc.thoughtSignature;
       message.tool_calls.push({
-        id: fc.id ?? "call_" + generateId(),
+        id: fc.id ?? "call*" + generateId(),
         type: "function",
         function: {
           name: fc.name,
           arguments: JSON.stringify(fc.args),
         },
-        extra_content: thought_signature ? {google: { thought_signature }} : undefined,
+        extra_content: thought_signature ? { google: { thought_signature } } : undefined,
       });
     } else if (typeof part.text === "string") {
       const len = message.content.length;
@@ -558,14 +564,14 @@ function transformCandidates (key, cand) {
         } else {
           prefix = "</thought>\n\n";
           if (len) {
-            message.content[len-1] = message.content[len-1].trimEnd() + "\n";
+            message.content[len - 1] = message.content[len - 1].trimEnd() + "\n";
           } else {
             prefix += "\n";
           }
         }
         part.text = prefix + part.text;
       } else if (len) {
-        message.content[len-1] += SEP;
+        message.content[len - 1] += SEP;
       }
       message.content.push(part.text);
       if (thought_signature && part.thoughtSignature) {
@@ -573,12 +579,12 @@ function transformCandidates (key, cand) {
       }
       thought_signature = part.thoughtSignature;
     } else {
-      throw new Error("Unexpected part type: " + JSON.stringify(part,2));
+      throw new Error("Unexpected part type: " + JSON.stringify(part, 2));
     }
   }
   message.content = message.content.join("") ?? null;
   if (thought_signature) {
-    message.extra_content = {google: { thought_signature }};
+    message.extra_content = { google: { thought_signature } };
   }
   return {
     index: cand.index ?? 0,
@@ -589,7 +595,9 @@ function transformCandidates (key, cand) {
 }
 
 const notEmpty = (el) => Object.values(el).some(Boolean) ? el : undefined;
+
 const sum = (...numbers) => numbers.reduce((total, num) => total + (num ?? 0), 0);
+
 const transformUsage = (data) => ({
   completion_tokens: sum(data.candidatesTokenCount, data.toolUsePromptTokenCount, data.thoughtsTokenCount),
   prompt_tokens: data.promptTokenCount,
@@ -605,7 +613,7 @@ const transformUsage = (data) => ({
       ?.find(el => el.modality === "AUDIO")
       ?.tokenCount,
     cached_tokens: data.cacheTokensDetails
-      ?.reduce((acc,el) => acc + el.tokenCount, 0),
+      ?.reduce((acc, el) => acc + el.tokenCount, 0),
   }),
 });
 
@@ -631,19 +639,20 @@ const processCompletionsResponse = (data, model, id) => {
   const obj = {
     id: data.responseId ?? id,
     choices: data.candidates.map(transformCandidates.bind({}, "message")),
-    created: Math.floor(Date.now()/1000),
+    created: Math.floor(Date.now() / 1000),
     model: data.modelVersion ?? model,
     object: "chat.completion",
     usage: data.usageMetadata && transformUsage(data.usageMetadata),
   };
-  if (obj.choices.length === 0 ) {
+  if (obj.choices.length === 0) {
     checkPromptBlock(obj.choices, data.promptFeedback, "message");
   }
   return JSON.stringify(obj);
 };
 
 const responseLineRE = /^data: (.*)(?:\n\n|\r\r|\r\n\r\n)/;
-function parseStream (chunk, controller) {
+
+function parseStream(chunk, controller) {
   this.buffer += chunk;
   do {
     const match = this.buffer.match(responseLineRE);
@@ -652,7 +661,8 @@ function parseStream (chunk, controller) {
     this.buffer = this.buffer.substring(match[0].length);
   } while (true);
 }
-function parseStreamFlush (controller) {
+
+function parseStreamFlush(controller) {
   if (this.buffer) {
     console.error("Invalid data:", this.buffer);
     controller.enqueue(this.buffer);
@@ -661,12 +671,13 @@ function parseStreamFlush (controller) {
 }
 
 const delimiter = "\n\n";
+
 const sseline = (obj) => {
-  obj.created = Math.floor(Date.now()/1000);
+  obj.created = Math.floor(Date.now() / 1000);
   return "data: " + JSON.stringify(obj) + delimiter;
 };
 
-function toOpenAiStream (line, controller) {
+function toOpenAiStream(line, controller) {
   let data;
   try {
     data = JSON.parse(line);
@@ -675,7 +686,7 @@ function toOpenAiStream (line, controller) {
     }
   } catch (err) {
     console.error("Error parsing response:", err);
-    if (!this.shared.is_buffers_rest) { line =+ delimiter; }
+    if (!this.shared.is_buffers_rest) { line = line; }
     controller.enqueue(line);
     return;
   }
@@ -699,6 +710,7 @@ function toOpenAiStream (line, controller) {
     controller.enqueue(sseline(obj));
     return;
   }
+  console.assert(data.candidates.length === 1, "Unexpected candidates count: %d", data.candidates.length);
   const cand = obj.choices[0];
   cand.index ??= 0;
   const finish_reason = cand.finish_reason;
@@ -721,7 +733,7 @@ function toOpenAiStream (line, controller) {
   this.last[cand.index] = obj;
 }
 
-function toOpenAiStreamFlush (controller) {
+function toOpenAiStreamFlush(controller) {
   if (this.last.length > 0) {
     for (const obj of this.last) {
       controller.enqueue(sseline(obj));
