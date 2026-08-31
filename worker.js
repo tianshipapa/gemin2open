@@ -1,731 +1,186 @@
-// Cloudflare Pages Functions 兼容版 - OpenAI 格式 Gemini 代理
+/**
+ * Cloudflare Worker: Gemini to OpenAI API Proxy
+ * 部署后，baseURL 填写 Worker 的地址，API Key 填写你的 Gemini API Key
+ */
+
 export default {
-  async fetch (request, env, ctx) {
-    if (request.method === "OPTIONS") {
-      return handleOPTIONS();
-    }
-    const errHandler = (err) => {
-      console.error(err);
-      return new Response(err.message, fixCors({ status: err.status ?? 500 }));
-    };
-    try {
-      const auth = request.headers.get("Authorization");
-      const apiKey = auth?.split(" ")[1];
-      const assert = (success) => {
-        if (!success) {
-          throw new HttpError("The specified HTTP method is not allowed for the requested resource", 400);
-        }
-      };
-      const { pathname } = new URL(request.url);
-      switch (true) {
-        case pathname.endsWith("/chat/completions"):
-          assert(request.method === "POST");
-          return handleCompletions(await request.json(), apiKey)
-            .catch(errHandler);
-        case pathname.endsWith("/embeddings"):
-          assert(request.method === "POST");
-          return handleEmbeddings(await request.json(), apiKey)
-            .catch(errHandler);
-        case pathname.endsWith("/models"):
-          assert(request.method === "GET");
-          return handleModels(apiKey)
-            .catch(errHandler);
-        default:
-          throw new HttpError("404 Not Found", 404);
-      }
-    } catch (err) {
-      return errHandler(err);
-    }
-  }
-};
+  async fetch(request, env, ctx) {
+    const url = new URL(request.url);
 
-class HttpError extends Error {
-  constructor(message, status) {
-    super(message);
-    this.name = this.constructor.name;
-    this.status = status;
-  }
-}
-
-const fixCors = ({ headers, status, statusText }) => {
-  headers = new Headers(headers);
-  headers.set("Access-Control-Allow-Origin", "*");
-  return { headers, status, statusText };
-};
-
-const handleOPTIONS = async () => {
-  return new Response(null, {
-    headers: {
-      "Access-Control-Allow-Origin": "*",
-      "Access-Control-Allow-Methods": "*",
-      "Access-Control-Allow-Headers": "*",
-    }
-  });
-};
-
-const BASE_URL = "https://generativelanguage.googleapis.com";
-const API_VERSION = "v1beta";
-const API_CLIENT = "google-genai-sdk/2.19.0";
-
-const makeHeaders = (apiKey, more) => ({
-  "x-goog-api-client": API_CLIENT,
-  ...(apiKey && { "x-goog-api-key": apiKey }),
-  ...more
-});
-
-async function handleModels (apiKey) {
-  const response = await fetch(`${BASE_URL}/${API_VERSION}/models`, {
-    headers: makeHeaders(apiKey),
-  });
-  let { body } = response;
-  if (response.ok) {
-    const { models } = JSON.parse(await response.text());
-    body = JSON.stringify({
-      object: "list",
-      data: models.map(({ name }) => ({
-        id: name.replace("models/", ""),
-        object: "model",
-        created: 0,
-        owned_by: "",
-      })),
-    }, null, "  ");
-  }
-  return new Response(body, fixCors(response));
-}
-
-const DEFAULT_EMBEDDINGS_MODEL = "gemini-embedding-001";
-async function handleEmbeddings (req, apiKey) {
-  let modelFull, model;
-  switch (true) {
-    case typeof req.model !== "string":
-      throw new HttpError("model is not specified", 400);
-    case req.model.startsWith("models/"):
-      modelFull = req.model;
-      model = modelFull.substring(7);
-      break;
-    case req.model.startsWith("gemini-"):
-      model = req.model;
-      break;
-    default:
-      model = DEFAULT_EMBEDDINGS_MODEL;
-  }
-  modelFull ??= "models/" + model;
-  if (!Array.isArray(req.input)) {
-    req.input = [ req.input ];
-  }
-  const response = await fetch(`${BASE_URL}/${API_VERSION}/${modelFull}:batchEmbedContents`, {
-    method: "POST",
-    headers: makeHeaders(apiKey, { "Content-Type": "application/json" }),
-    body: JSON.stringify({
-      "requests": req.input.map(text => ({
-        model: modelFull,
-        content: { parts: { text } },
-        outputDimensionality: req.dimensions,
-      }))
-    })
-  });
-  let { body } = response;
-  if (response.ok) {
-    const { embeddings } = JSON.parse(await response.text());
-    body = JSON.stringify({
-      object: "list",
-      data: embeddings.map(({ values }, index) => ({
-        object: "embedding",
-        index,
-        embedding: values,
-      })),
-      model,
-    }, null, "  ");
-  }
-  return new Response(body, fixCors(response));
-}
-
-const DEFAULT_MODEL = "gemini-flash-latest";
-async function handleCompletions (req, apiKey) {
-  let model = req.model;
-  switch (true) {
-    case typeof model !== "string":
-      throw new HttpError("model is not specified", 400);
-    case model.startsWith("models/"):
-      model = model.substring(7);
-      break;
-    case model.startsWith("gemini-"):
-    case model.startsWith("gemma-"):
-      break;
-    default:
-      model = DEFAULT_MODEL;
-  }
-  let isV3 = model.startsWith("gemini-3");
-  let body = await transformRequest(req, isV3);
-  const extra = req.extra_body?.google;
-  if (extra) {
-    if (extra.safety_settings) {
-      body.safetySettings = extra.safety_settings;
-    }
-    if (extra.cached_content) {
-      body.cachedContent = extra.cached_content;
-    }
-    if (extra.thinking_config) {
-      body.generationConfig.thinkingConfig = extra.thinking_config;
-    }
-  }
-  switch (true) {
-    case model.endsWith(":search"):
-      model = model.slice(0,-7);
-    case req.model?.includes("-search-preview"):
-      body.tools ??= [];
-      body.tools.push({googleSearch: {}});
-  }
-  const TASK = req.stream ? "streamGenerateContent" : "generateContent";
-  let url = `${BASE_URL}/${API_VERSION}/models/${model}:${TASK}`;
-  if (req.stream) { url += "?alt=sse"; }
-  const response = await fetch(url, {
-    method: "POST",
-    headers: makeHeaders(apiKey, { "Content-Type": "application/json" }),
-    body: JSON.stringify(body),
-  });
-  body = response.body;
-  if (response.ok) {
-    let id = "chatcmpl-" + generateId();
-    const shared = {};
-    if (req.stream) {
-      body = response.body
-        .pipeThrough(new TextDecoderStream())
-        .pipeThrough(new TransformStream({
-          transform: parseStream,
-          flush: parseStreamFlush,
-          buffer: "",
-          shared,
-        }))
-        .pipeThrough(new TransformStream({
-          transform: toOpenAiStream,
-          flush: toOpenAiStreamFlush,
-          streamIncludeUsage: req.stream_options?.include_usage,
-          model, id, last: [],
-          shared,
-        }))
-        .pipeThrough(new TextEncoderStream());
-    } else {
-      body = await response.text();
+    // 只处理 /v1/chat/completions 的 POST 请求
+    if (url.pathname === '/v1/chat/completions' && request.method === 'POST') {
       try {
-        body = JSON.parse(body);
-        if (!body.candidates) {
-          throw new Error("Invalid completion object");
+        const openaiReq = await request.json();
+
+        // 从 Authorization 头中提取 Gemini API Key
+        const authHeader = request.headers.get('Authorization') || '';
+        const apiKey = authHeader.replace('Bearer ', '').trim();
+
+        if (!apiKey) {
+          return new Response(
+            JSON.stringify({ error: '未提供 API Key，请在 Authorization 头中携带 Gemini API Key' }),
+            { status: 401, headers: { 'Content-Type': 'application/json' } }
+          );
         }
-      } catch (err) {
-        console.error("Error parsing response:", err);
-        return new Response(body, fixCors(response));
-      }
-      body = processCompletionsResponse(body, model, id);
-    }
-  }
-  return new Response(body, fixCors(response));
-}
 
-const adjustProps = (schemaPart) => {
-  if (typeof schemaPart !== "object" || schemaPart === null) {
-    return;
-  }
-  if (Array.isArray(schemaPart)) {
-    schemaPart.forEach(adjustProps);
-  } else {
-    if (schemaPart.type === "object" && schemaPart.properties && schemaPart.additionalProperties === false) {
-      delete schemaPart.additionalProperties;
-    }
-    Object.values(schemaPart).forEach(adjustProps);
-  }
-};
+        // 模型映射（如果你在客户端填了 gpt-3.5-turbo，会自动映射到 gemini 模型）
+        const modelMap = {
+          'gpt-3.5-turbo': 'gemini-2.0-flash',
+          'gpt-4': 'gemini-2.0-flash',
+          'gpt-4o': 'gemini-2.0-flash',
+        };
+        const model = modelMap[openaiReq.model] || openaiReq.model || 'gemini-2.0-flash';
+        const isStream = openaiReq.stream || false;
 
-const adjustSchema = (schema) => {
-  const obj = schema[schema.type];
-  delete obj.strict;
-  delete obj.parameters?.$schema;
-  return adjustProps(schema);
-};
+        // 将 OpenAI messages 转换为 Gemini contents
+        const contents = [];
+        let systemInstruction = '';
 
-const harmCategory = [
-  "HARM_CATEGORY_HATE_SPEECH",
-  "HARM_CATEGORY_SEXUALLY_EXPLICIT",
-  "HARM_CATEGORY_DANGEROUS_CONTENT",
-  "HARM_CATEGORY_HARASSMENT",
-  "HARM_CATEGORY_CIVIC_INTEGRITY",
-];
-const safetySettings = harmCategory.map(category => ({
-  category,
-  threshold: "BLOCK_NONE",
-}));
-
-const fieldsMap = {
-  frequency_penalty: "frequencyPenalty",
-  max_completion_tokens: "maxOutputTokens",
-  max_tokens: "maxOutputTokens",
-  n: "candidateCount",
-  presence_penalty: "presencePenalty",
-  seed: "seed",
-  stop: "stopSequences",
-  temperature: "temperature",
-  top_k: "topK",
-  top_p: "topP",
-};
-
-const thinkingBudgetMap = {
-  none: 0,
-  minimal: 1024,
-  low: 1024,
-  medium: 8192,
-  high: 24576,
-  xhigh: 32768,
-};
-const thinkingLevelMap = {
-  none: "minimal",
-  xhigh: "high",
-};
-
-const transformConfig = (req, isV3) => {
-  let cfg = {};
-  for (let key in req) {
-    const matchedKey = fieldsMap[key];
-    if (matchedKey) {
-      cfg[matchedKey] = req[key];
-    }
-  }
-  if (req.response_format) {
-    switch (req.response_format.type) {
-      case "json_schema":
-        adjustSchema(req.response_format);
-        cfg.responseSchema = req.response_format.json_schema?.schema;
-        if (cfg.responseSchema && "enum" in cfg.responseSchema) {
-          cfg.responseMimeType = "text/x.enum";
-          break;
-        }
-      case "json_object":
-        cfg.responseMimeType = "application/json";
-        break;
-      case "text":
-        cfg.responseMimeType = "text/plain";
-        break;
-      default:
-        throw new HttpError("Unsupported response_format.type", 400);
-    }
-  }
-  if (req.reasoning_effort) {
-    cfg.thinkingConfig =
-      isV3
-        ? { thinkingLevel: thinkingLevelMap[req.reasoning_effort] ?? req.reasoning_effort }
-        : { thinkingBudget: thinkingBudgetMap[req.reasoning_effort] };
-  }
-  return cfg;
-};
-
-// 替换 Node.js Buffer 为 Web 原生 API，适配 Cloudflare 运行时
-const parseImg = async (url) => {
-  let mimeType, data;
-  if (url.startsWith("http://") || url.startsWith("https://")) {
-    try {
-      const response = await fetch(url);
-      if (!response.ok) {
-        throw new Error(`${response.status} ${response.statusText} (${url})`);
-      }
-      mimeType = response.headers.get("content-type");
-      const arrayBuffer = await response.arrayBuffer();
-      data = btoa(String.fromCharCode(...new Uint8Array(arrayBuffer)));
-    } catch (err) {
-      throw new Error("Error fetching image: " + err.toString());
-    }
-  } else {
-    const match = url.match(/^data:(?<mimeType>.*?)(;base64)?,(?<data>.*)$/);
-    if (!match) {
-      throw new HttpError("Invalid image data: " + url, 400);
-    }
-    ({ mimeType, data } = match.groups);
-  }
-  return {
-    inlineData: {
-      mimeType,
-      data,
-    },
-  };
-};
-
-const transformFnResponse = ({ content, tool_call_id }, parts) => {
-  if (!parts.calls) {
-    throw new HttpError("No function calls found in the previous message", 400);
-  }
-  let response;
-  try {
-    response = JSON.parse(content);
-  } catch (err) {
-    console.error("Error parsing function response content:", err);
-    throw new HttpError("Invalid function response: " + content, 400);
-  }
-  if (typeof response !== "object" || response === null || Array.isArray(response)) {
-    response = { result: response };
-  }
-  if (!tool_call_id) {
-    throw new HttpError("tool_call_id not specified", 400);
-  }
-  const { i, name } = parts.calls[tool_call_id] ?? {};
-  if (!name) {
-    throw new HttpError("Unknown tool_call_id: " + tool_call_id, 400);
-  }
-  if (parts[i]) {
-    throw new HttpError("Duplicated tool_call_id: " + tool_call_id, 400);
-  }
-  parts[i] = {
-    functionResponse: {
-      id: tool_call_id.startsWith("call_") ? null : tool_call_id,
-      name,
-      response,
-    }
-  };
-};
-
-const transformFnCalls = ({ tool_calls }) => {
-  const calls = {};
-  const parts = tool_calls.map(({ function: { arguments: argstr, name }, id, type, extra_content }, i) => {
-    if (type !== "function") {
-      throw new HttpError(`Unsupported tool_call type: "${type}"`, 400);
-    }
-    let args;
-    try {
-      args = JSON.parse(argstr);
-    } catch (err) {
-      console.error("Error parsing function arguments:", err);
-      throw new HttpError("Invalid function arguments: " + argstr, 400);
-    }
-    calls[id] = {i, name};
-    return {
-      functionCall: {
-        id: id.startsWith("call_") ? null : id,
-        name,
-        args,
-      },
-      thoughtSignature: extra_content?.google?.thought_signature,
-    };
-  });
-  parts.calls = calls;
-  return parts;
-};
-
-const transformMsg = async ({ content, extra_content }) => {
-  const thoughtSignature = extra_content?.google?.thought_signature;
-  const parts = [];
-  if (!Array.isArray(content)) {
-    parts.push({ text: content, thoughtSignature });
-    return parts;
-  }
-  for (const item of content) {
-    switch (item.type) {
-      case "text":
-        parts.push({ text: item.text });
-        break;
-      case "image_url":
-        parts.push(await parseImg(item.image_url.url));
-        break;
-      case "input_audio":
-        parts.push({
-          inlineData: {
-            mimeType: "audio/" + item.input_audio.format,
-            data: item.input_audio.data,
+        for (const msg of openaiReq.messages || []) {
+          if (msg.role === 'system') {
+            systemInstruction = msg.content;
+            continue;
           }
-        });
-        break;
-      default:
-        throw new HttpError(`Unknown "content" item type: "${item.type}"`, 400);
-    }
-  }
-  if (thoughtSignature) {
-    if (parts.length === 1) {
-      parts[0].thoughtSignature = thoughtSignature;
-    } else {
-      parts.push({ text:"", thoughtSignature });
-    }
-  }
-  if (content.every(item => item.type === "image_url")) {
-    parts.push({ text: "" });
-  }
-  return parts;
-};
-
-const transformMessages = async (messages) => {
-  if (!messages) { return; }
-  const contents = [];
-  let system_instruction;
-  for (const item of messages) {
-    switch (item.role) {
-      case "system":
-        system_instruction = { parts: await transformMsg(item) };
-        continue;
-      case "tool":
-        let { role, parts } = contents[contents.length - 1] ?? {};
-        if (role !== "function") {
-          const calls = parts?.calls;
-          parts = []; parts.calls = calls;
+          // Gemini 的角色是 'user' 或 'model'
+          const role = msg.role === 'assistant' ? 'model' : 'user';
           contents.push({
-            role: "function",
-            parts
+            role: role,
+            parts: [{ text: msg.content }],
           });
         }
-        transformFnResponse(item, parts);
-        continue;
-      case "assistant":
-        item.role = "model";
-        break;
-      case "user":
-        break;
-      default:
-        throw new HttpError(`Unknown message role: "${item.role}"`, 400);
-    }
-    contents.push({
-      role: item.role,
-      parts: item.tool_calls ? transformFnCalls(item) : await transformMsg(item)
-    });
-  }
-  if (system_instruction) {
-    if (!contents[0]?.parts.some(part => part.text)) {
-      contents.unshift({ role: "user", parts: { text: " " } });
-    }
-  }
-  return { system_instruction, contents };
-};
 
-const transformTools = (req) => {
-  let tools, tool_config;
-  if (req.tools) {
-    const funcs = req.tools.filter(tool => tool.type === "function");
-    funcs.forEach(adjustSchema);
-    tools = [{ function_declarations: funcs.map(schema => schema.function) }];
-  }
-  if (req.tool_choice) {
-    const allowed_function_names = req.tool_choice?.type === "function" ? [ req.tool_choice?.function?.name ] : undefined;
-    if (allowed_function_names || typeof req.tool_choice === "string") {
-      tool_config = {
-        function_calling_config: {
-          mode: allowed_function_names ? "ANY" : req.tool_choice.toUpperCase(),
-          allowed_function_names
-        }
-      };
-    }
-  }
-  return { tools, tool_config };
-};
+        // 构建 Gemini API URL
+        const geminiEndpoint = isStream ? 'streamGenerateContent' : 'generateContent';
+        const geminiUrl = `https://generativelanguage.googleapis.com/v1beta/models/${model}:${geminiEndpoint}?key=${apiKey}&alt=${isStream ? 'sse' : 'json'}`;
 
-const transformRequest = async (req, isV3) => ({
-  ...await transformMessages(req.messages),
-  safetySettings,
-  generationConfig: transformConfig(req,isV3),
-  ...transformTools(req),
-});
+        // 构建 Gemini 请求体
+        const geminiBody = {
+          contents: contents,
+          ...(systemInstruction && {
+            systemInstruction: { parts: [{ text: systemInstruction }] },
+          }),
+          generationConfig: {
+            ...(openaiReq.temperature !== undefined && { temperature: openaiReq.temperature }),
+            ...(openaiReq.max_tokens !== undefined && { maxOutputTokens: openaiReq.max_tokens }),
+            ...(openaiReq.top_p !== undefined && { topP: openaiReq.top_p }),
+          },
+        };
 
-const generateId = () => {
-  const characters = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789";
-  const randomChar = () => characters[Math.floor(Math.random() * characters.length)];
-  return Array.from({ length: 29 }, randomChar).join("");
-};
+        // 调用 Gemini API
+        const geminiRes = await fetch(geminiUrl, {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify(geminiBody),
+        });
 
-const reasonsMap = {
-  "STOP": "stop",
-  "MAX_TOKENS": "length",
-  "SAFETY": "content_filter",
-  "RECITATION": "content_filter",
-};
-
-const SEP = "\n\n|>";
-function transformCandidates (key, cand) {
-  const message = { role: "assistant", content: [] };
-  let thought_signature;
-  for (const part of cand.content?.parts ?? []) {
-    if (part.functionCall) {
-      const fc = part.functionCall;
-      message.tool_calls ??= [];
-      const thought_signature = fc.thoughtSignature;
-      message.tool_calls.push({
-        id: fc.id ?? "call_" + generateId(),
-        type: "function",
-        function: {
-          name: fc.name,
-          arguments: JSON.stringify(fc.args),
-        },
-        extra_content: thought_signature ? {google: { thought_signature }} : undefined,
-      });
-    } else if (typeof part.text === "string") {
-      const len = message.content.length;
-      if (part.thought !== this.isThinking) {
-        this.isThinking = part.thought;
-        let prefix;
-        if (part.thought) {
-          prefix = "<thought>\n";
-        } else {
-          prefix = "</thought>\n\n";
-          if (len) {
-            message.content[len-1] = message.content[len-1].trimEnd() + "\n";
-          } else {
-            prefix += "\n";
+        // ===== 非流式响应 =====
+        if (!isStream) {
+          if (!geminiRes.ok) {
+            const errText = await geminiRes.text();
+            return new Response(errText, { status: geminiRes.status });
           }
+          const geminiData = await geminiRes.json();
+          const text = geminiData.candidates?.[0]?.content?.parts?.[0]?.text || '';
+
+          const openaiResponse = {
+            id: 'chatcmpl-' + Math.random().toString(36).substring(2, 11),
+            object: 'chat.completion',
+            created: Math.floor(Date.now() / 1000),
+            model: model,
+            choices: [
+              {
+                index: 0,
+                message: { role: 'assistant', content: text },
+                finish_reason: 'stop',
+              },
+            ],
+            usage: { prompt_tokens: 0, completion_tokens: 0, total_tokens: 0 },
+          };
+
+          return new Response(JSON.stringify(openaiResponse), {
+            headers: { 'Content-Type': 'application/json' },
+          });
         }
-        part.text = prefix + part.text;
-      } else if (len) {
-        message.content[len-1] += SEP;
+
+        // ===== 流式响应 =====
+        const { readable, writable } = new TransformStream();
+        const writer = writable.getWriter();
+        const encoder = new TextEncoder();
+        const decoder = new TextDecoder();
+
+        (async () => {
+          const reader = geminiRes.body.getReader();
+          try {
+            while (true) {
+              const { done, value } = await reader.read();
+              if (done) {
+                await writer.write(encoder.encode('data: [DONE]\n\n'));
+                break;
+              }
+              const chunk = decoder.decode(value, { stream: true });
+              const lines = chunk.split('\n');
+
+              for (const line of lines) {
+                if (line.startsWith('data: ')) {
+                  const jsonStr = line.slice(6).trim();
+                  if (!jsonStr) continue;
+                  try {
+                    const data = JSON.parse(jsonStr);
+                    const text = data.candidates?.[0]?.content?.parts?.[0]?.text || '';
+                    if (text) {
+                      const openaiChunk = {
+                        id: 'chatcmpl-' + Math.random().toString(36).substring(2, 11),
+                        object: 'chat.completion.chunk',
+                        created: Math.floor(Date.now() / 1000),
+                        model: model,
+                        choices: [
+                          {
+                            index: 0,
+                            delta: { content: text },
+                            finish_reason: null,
+                          },
+                        ],
+                      };
+                      await writer.write(
+                        encoder.encode('data: ' + JSON.stringify(openaiChunk) + '\n\n')
+                      );
+                    }
+                  } catch (e) {
+                    // 忽略解析错误
+                  }
+                }
+              }
+            }
+          } catch (err) {
+            console.error(err);
+          } finally {
+            writer.close();
+          }
+        })();
+
+        return new Response(readable, {
+          headers: {
+            'Content-Type': 'text/event-stream',
+            'Cache-Control': 'no-cache',
+            Connection: 'keep-alive',
+          },
+        });
+
+      } catch (err) {
+        return new Response(
+          JSON.stringify({ error: '服务器内部错误: ' + err.message }),
+          { status: 500, headers: { 'Content-Type': 'application/json' } }
+        );
       }
-      message.content.push(part.text);
-      if (thought_signature && part.thoughtSignature) {
-        throw new Error("Unexpected multiple thoughtSignature");
-      }
-      thought_signature = part.thoughtSignature;
-    } else {
-      throw new Error("Unexpected part type: " + JSON.stringify(part,2));
     }
-  }
-  message.content = message.content.join("") ?? null;
-  if (thought_signature) {
-    message.extra_content = {google: { thought_signature }};
-  }
-  return {
-    index: cand.index ?? 0,
-    [key]: message,
-    logprobs: null,
-    finish_reason: message.tool_calls ? "tool_calls" : reasonsMap[cand.finishReason] ?? cand.finishReason,
-  };
-}
 
-const notEmpty = (el) => Object.values(el).some(Boolean) ? el : undefined;
-const sum = (...numbers) => numbers.reduce((total, num) => total + (num ?? 0), 0);
-const transformUsage = (data) => ({
-  completion_tokens: sum(data.candidatesTokenCount, data.toolUsePromptTokenCount, data.thoughtsTokenCount),
-  prompt_tokens: data.promptTokenCount,
-  total_tokens: data.totalTokenCount,
-  completion_tokens_details: notEmpty({
-    audio_tokens: data.candidatesTokensDetails
-      ?.find(el => el.modality === "AUDIO")
-      ?.tokenCount,
-    reasoning_tokens: data.thoughtsTokenCount,
-  }),
-  prompt_tokens_details: notEmpty({
-    audio_tokens: data.promptTokensDetails
-      ?.find(el => el.modality === "AUDIO")
-      ?.tokenCount,
-    cached_tokens: data.cacheTokensDetails
-      ?.reduce((acc,el) => acc + el.tokenCount, 0),
-  }),
-});
-
-const checkPromptBlock = (choices, promptFeedback, key) => {
-  if (choices.length) { return; }
-  if (promptFeedback?.blockReason) {
-    console.log("Prompt block reason:", promptFeedback.blockReason);
-    if (promptFeedback.blockReason === "SAFETY") {
-      promptFeedback.safetyRatings
-        .filter(r => r.blocked)
-        .forEach(r => console.log(r));
+    // 健康检查 / 其他请求
+    if (url.pathname === '/' || url.pathname === '/v1') {
+      return new Response(JSON.stringify({ message: 'Gemini to OpenAI Proxy is running!' }), {
+        headers: { 'Content-Type': 'application/json' },
+      });
     }
-    choices.push({
-      index: 0,
-      [key]: null,
-      finish_reason: "content_filter",
-    });
-  }
-  return true;
+
+    return new Response('Not Found', { status: 404 });
+  },
 };
-
-const processCompletionsResponse = (data, model, id) => {
-  const obj = {
-    id: data.responseId ?? id,
-    choices: data.candidates.map(transformCandidates.bind({}, "message")),
-    created: Math.floor(Date.now()/1000),
-    model: data.modelVersion ?? model,
-    object: "chat.completion",
-    usage: data.usageMetadata && transformUsage(data.usageMetadata),
-  };
-  if (obj.choices.length === 0 ) {
-    checkPromptBlock(obj.choices, data.promptFeedback, "message");
-  }
-  return JSON.stringify(obj);
-};
-
-const responseLineRE = /^data: (.*)(?:\n\n|\r\r|\r\n\r\n)/;
-function parseStream (chunk, controller) {
-  this.buffer += chunk;
-  do {
-    const match = this.buffer.match(responseLineRE);
-    if (!match) { break; }
-    controller.enqueue(match[1]);
-    this.buffer = this.buffer.substring(match[0].length);
-  } while (true);
-}
-function parseStreamFlush (controller) {
-  if (this.buffer) {
-    console.error("Invalid data:", this.buffer);
-    controller.enqueue(this.buffer);
-    this.shared.is_buffers_rest = true;
-  }
-}
-
-const delimiter = "\n\n";
-const sseline = (obj) => {
-  obj.created = Math.floor(Date.now()/1000);
-  return "data: " + JSON.stringify(obj) + delimiter;
-};
-
-function toOpenAiStream (line, controller) {
-  let data;
-  try {
-    data = JSON.parse(line);
-    if (!data.candidates) {
-      throw new Error("Invalid completion chunk object");
-    }
-  } catch (err) {
-    console.error("Error parsing response:", err);
-    if (!this.shared.is_buffers_rest) { line =+ delimiter; }
-    controller.enqueue(line);
-    return;
-  }
-  let obj;
-  try {
-    obj = {
-      id: data.responseId ?? this.id,
-      choices: data.candidates.map(transformCandidates.bind(this, "delta")),
-      model: data.modelVersion ?? this.model,
-      object: "chat.completion.chunk",
-      usage: data.usageMetadata && this.streamIncludeUsage ? null : undefined,
-    };
-  } catch (err) {
-    console.error(err);
-    controller.enqueue("Unexpected error while handling request: " + err.message);
-    controller.enqueue("\n\n" + line);
-    controller.terminate();
-    return;
-  }
-  if (checkPromptBlock(obj.choices, data.promptFeedback, "delta")) {
-    controller.enqueue(sseline(obj));
-    return;
-  }
-  const cand = obj.choices[0];
-  cand.index ??= 0;
-  const finish_reason = cand.finish_reason;
-  cand.finish_reason = null;
-  if (!this.last[cand.index]) {
-    controller.enqueue(sseline({
-      ...obj,
-      choices: [{ ...cand, tool_calls: undefined, delta: { role: "assistant", content: "" } }],
-    }));
-  }
-  delete cand.delta.role;
-  if ("content" in cand.delta) {
-    controller.enqueue(sseline(obj));
-  }
-  cand.finish_reason = finish_reason;
-  if (data.usageMetadata && this.streamIncludeUsage) {
-    obj.usage = transformUsage(data.usageMetadata);
-  }
-  cand.delta = {};
-  this.last[cand.index] = obj;
-}
-
-function toOpenAiStreamFlush (controller) {
-  if (this.last.length > 0) {
-    for (const obj of this.last) {
-      controller.enqueue(sseline(obj));
-    }
-    controller.enqueue("data: [DONE]" + delimiter);
-  }
-}
